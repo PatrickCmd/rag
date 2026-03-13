@@ -1,13 +1,15 @@
 import os
 from pathlib import Path
+from langchain_core import embeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
 from langchain_core.documents import Document
 from tenacity import retry, wait_exponential
-
+from concurrent.futures import ThreadPoolExecutor
+from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
-
+from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv(override=True)
 
@@ -17,12 +19,15 @@ MODEL = "gpt-4.1-mini"
 # groq_url = "https://api.groq.com/openai/v1"
 DB_NAME = str(Path(__file__).parent.parent / "vector_db")
 
-EMBEDDING_MODEL = "text-embedding-3-large"
-embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-RETRIEVAL_K_PER_QUERY = 10
+EMBEDDING_MODEL = "google/embeddinggemma-300m"
+
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+# embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+RETRIEVAL_K_PER_QUERY = 20
 RERANK_TOP_K = 5
-NUM_SUB_QUESTIONS = 2
+NUM_SUB_QUESTIONS = 3
 wait = wait_exponential(multiplier=1, min=10, max=240)
+
 
 SYSTEM_PROMPT = """
 You are a knowledgeable, friendly assistant representing the company Insurellm.
@@ -32,7 +37,8 @@ If you don't know the answer, say so.
 For context, here are specific extracts from the Knowledge Base that might be directly relevant to the user's question:
 {context}
 
-With this context, please answer the user's question. Be accurate, relevant and complete.
+With this context, please answer the user's question.
+Include ALL relevant details, names, numbers, and specifics from the context. Do not summarize or omit details.
 """
 
 vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
@@ -99,13 +105,14 @@ def generate_sub_questions(query: str, n: int = 5, history: list[dict] | None = 
 
 
 def retrieve_chunks(queries: list[str], k_per_query: int = 10) -> list[Document]:
-    """
-    Retrieve chunks from ChromaDB for each query; returns combined list (may contain duplicates).
-    """
+    def _search(q):
+        return vectorstore.similarity_search(q, k=k_per_query)
+    
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        results = pool.map(_search, queries)
     docs = []
-    for q in queries:
-        chunk = vectorstore.similarity_search(q, k=k_per_query)
-        docs.extend(chunk)
+    for result in results:
+        docs.extend(result)
     return docs
 
 
@@ -160,13 +167,24 @@ def fetch_context(question: str, history: list[dict] | None = None) -> list[Docu
     Retrieve relevant context: query expansion → multi-query retrieval → dedupe → re-rank (top-k).
     """
     history = history or []
-    sub_questions = generate_sub_questions(question, n=NUM_SUB_QUESTIONS, history=history)
-    all_queries = [question] + sub_questions
-    docs = retrieve_chunks(all_queries, k_per_query=RETRIEVAL_K_PER_QUERY)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+            # Start original-query retrieval immediately
+            original_future = pool.submit(
+                vectorstore.similarity_search, question, k=RETRIEVAL_K_PER_QUERY
+            )
+            # Generate sub-questions in parallel
+            sub_q_future = pool.submit(
+                generate_sub_questions, question, NUM_SUB_QUESTIONS, history
+            )
+            original_docs = original_future.result()
+            sub_questions = sub_q_future.result()
+    
+    # Retrieve for sub-questions only
+    sub_docs = retrieve_chunks(sub_questions, k_per_query=RETRIEVAL_K_PER_QUERY)
+    docs = original_docs + sub_docs
     docs = deduplicate_chunks(docs)
     docs = rerank_chunks(question, docs, top_k=RERANK_TOP_K)
     return docs
-
 
 @retry(wait=wait)
 def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Document]]:
