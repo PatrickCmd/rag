@@ -9,6 +9,8 @@ from litellm import completion
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 from tenacity import retry, wait_exponential
+from langchain_huggingface import HuggingFaceEmbeddings
+from sentence_transformers import CrossEncoder
 
 from dotenv import load_dotenv
 
@@ -18,7 +20,8 @@ MODEL = "openai/gpt-4.1-mini"
 DB_NAME = str(Path(__file__).parent.parent / "vector_db")
 KNOWLEDGE_BASE_PATH = Path(__file__).parent.parent / "knowledge-base"
 
-EMBEDDING_MODEL = "text-embedding-3-large"
+# EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_MODEL = "google/embeddinggemma-300m"
 AVERAGE_CHUNK_SIZE = 500
 WORKERS = 5
 wait = wait_exponential(multiplier=1, min=10, max=240)
@@ -128,7 +131,8 @@ def create_chunks(documents: list[dict]) -> list[Result]:
 
 def create_embeddings(chunks: list[Result]) -> Chroma:
     """Embed chunks with OpenAI and persist to Chroma. Uses same embedding model as ingest for retrieval."""
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    # embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
     docs = [
         Document(page_content=c.page_content, metadata=c.metadata)
         for c in chunks
